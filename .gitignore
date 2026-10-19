@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.log
 vendorlog*
+build/
+dist/
+*.egg-info/
+.venv/

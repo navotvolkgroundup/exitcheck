@@ -15,9 +15,18 @@ takes the blame.
 - One file. Read it before you run it.
 
 ```bash
-git clone https://github.com/YOURNAME/exitcheck && cd exitcheck
+git clone https://github.com/navotvolkgroundup/exitcheck && cd exitcheck
 python3 exitcheck.py scan --sweep
 ```
+
+Or install it:
+
+```bash
+pipx install git+https://github.com/navotvolkgroundup/exitcheck
+exitcheck scan --sweep
+```
+
+`scan` needs no router, no config and no account. It works on any network.
 
 ## What it checks
 
@@ -93,8 +102,13 @@ endpoints these SDKs call home to. Blocking them breaks the relay, not the app.
 | `blocklist-plain.txt` | NextDNS / Control D denylist (bare domains, paste in) |
 | `blocklist-pihole-regex.txt` | Pi-hole v5 regex table |
 
-Regenerate after editing `PROXYWARE_DOMAINS`: see the snippet in `CONTRIBUTING`
-or just re-run the three-line generator in the project history.
+Regenerate after editing `PROXYWARE_DOMAINS`:
+
+```bash
+python3 tools/gen-blocklists.py
+```
+
+CI fails if the lists drift out of sync with the source set.
 
 ## Honest limits
 
@@ -138,9 +152,18 @@ python3 test_exitcheck.py
 No framework. Covers the probe decision table (including the `200 OK` false
 positive), beacon detection, domain matching, log parsing and the ratio heuristic.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The two things that help most are
+**new proxyware domains** (with evidence) and **router backends** — `scan` works
+everywhere, but `router`, `log` and `monitor` currently only speak Sagemcom.
+
 ## Scope
 
 Scan only networks you own or are authorised to test. Port scanning and proxy
 probing other people's equipment is hostile and in many places illegal.
+
+This is a diagnostic: it reads, probes and reports. It does not change your
+router's configuration.
 
 MIT.

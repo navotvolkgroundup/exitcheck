@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: self-check
+        run: python3 test_exitcheck.py
+      - name: cli loads
+        run: |
+          python3 exitcheck.py --version
+          python3 exitcheck.py scan --help
+      - name: blocklists are in sync with PROXYWARE_DOMAINS
+        run: |
+          python3 tools/gen-blocklists.py
+          git diff --exit-code -- blocklist.txt blocklist-plain.txt blocklist-pihole-regex.txt \
+            || { echo "::error::blocklists are stale - run tools/gen-blocklists.py and commit"; exit 1; }

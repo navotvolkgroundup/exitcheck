@@ -120,7 +120,7 @@ def arp_table() -> dict[str, str]:
     return hosts
 
 def ping_sweep(cidr_base: str, workers=128) -> None:
-    """Ping .1-.254 to populate the ARP cache. cidr_base like '10.100.102'."""
+    """Ping .1-.254 to populate the ARP cache. cidr_base like '192.168.1'."""
     flag = "-W1" if sys.platform != "darwin" else "-W1000"
     def one(n):
         subprocess.run(["ping", "-c1", flag, f"{cidr_base}.{n}"],
@@ -129,7 +129,7 @@ def ping_sweep(cidr_base: str, workers=128) -> None:
         list(ex.map(one, range(1, 255)))
 
 def local_subnet() -> str | None:
-    """Best-effort /24 base of the primary interface, e.g. '10.100.102'."""
+    """Best-effort /24 base of the primary interface, e.g. '192.168.1'."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))

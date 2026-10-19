@@ -1,0 +1,42 @@
+name: Add a proxyware domain
+description: Propose a domain for the residential-proxy / proxyware blocklist
+title: "[domain] "
+labels: ["blocklist"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The blocklist is the part of this project with the shortest shelf life,
+        so these are the most valuable contributions. Evidence matters more than
+        volume — a short list everyone can trust beats a long list nobody does.
+  - type: input
+    id: domain
+    attributes:
+      label: Domain
+      description: Registrable domain. Subdomains are covered automatically.
+      placeholder: example-proxyware.com
+    validations: { required: true }
+  - type: input
+    id: product
+    attributes:
+      label: Which product or SDK uses it?
+      placeholder: Bright Data SDK, Honeygain, Castar ...
+    validations: { required: true }
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >
+        How do you know? Vendor docs, an SDK teardown, a research write-up, your
+        own capture. Please do not propose domains purely because a blocklist
+        somewhere else carries them.
+    validations: { required: true }
+  - type: checkboxes
+    id: collateral
+    attributes:
+      label: Collateral damage check
+      options:
+        - label: >
+            Blocking this stops the relaying, not the app itself (i.e. it is a
+            proxy control/telemetry endpoint, not a shared CDN or app backend).
+          required: true

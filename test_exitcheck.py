@@ -103,8 +103,8 @@ def main():
 
     # --- mac helpers ---------------------------------------------------
     assert E.norm_mac("0:1:2:a:bb:c") == "00:01:02:0A:BB:0C"
-    assert E.is_randomized("AE:30:FD:77:26:06") is True
-    assert E.is_randomized("8C:19:B5:38:C5:BE") is False
+    assert E.is_randomized("02:00:5E:00:53:0A") is True
+    assert E.is_randomized("00:00:5E:00:53:0A") is False
 
     # --- log parsing + end to end --------------------------------------
     log = "\n".join(
@@ -113,7 +113,7 @@ def main():
         [f"03.10.2026 {h:02d}:05:00 ERR DNS 0 DNS name resolution failure (x.getgrass.io)"
          for h in range(24)] +
         ["03.10.2026 22:35:19 ERR WIFI 0 A device failed to connect to SSID "
-         "(AE:30:FD:77:26:06) because it provided incorrect login information."])
+         "(02:00:5E:00:53:0A) because it provided incorrect login information."])
     r = E.analyse_log(log)
     assert r["records"] == 30, r["records"]
     assert [h[1] for h in r["proxyware"]] == ["getgrass.io"], r["proxyware"]
