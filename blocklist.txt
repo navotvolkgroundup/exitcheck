@@ -3,7 +3,7 @@
 !   (Bright Data, Hola, Castar, Honeygain, IPRoyal, PacketStream and friends).
 !   These are what a Smart TV or phone app contacts when it is being used as
 !   someone else's exit node. Blocking them breaks the relay, not the app.
-! Generated: 2026-10-19 from exitcheck PROXYWARE_DOMAINS (37 entries)
+! Generated: 2026-10-20 from exitcheck PROXYWARE_DOMAINS (37 entries)
 ! Syntax: Adblock-style. Works in AdGuard Home and Pi-hole v6 adlists.
 !   Each rule blocks the domain AND all its subdomains.
 !

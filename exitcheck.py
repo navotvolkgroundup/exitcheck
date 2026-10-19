@@ -72,7 +72,17 @@ NOTABLE = {
     23: "Telnet",
 }
 
-RELAY_HOST, RELAY_PORT, RELAY_MARKER = "example.com", 80, "Example Domain"
+# The relay oracle. We confirm RELAY by fetching this through the suspect port
+# and looking for the marker, so it MUST be reachable and plain-HTTP.
+# Not example.com: it is RFC 2606 reserved and some networks NXDOMAIN it, which
+# silently turns every RELAY into a false negative. preflight() now checks.
+# captive.apple.com is plain-HTTP by design, globally reachable, and returns a
+# fixed body. The marker is the whole title tag, not the bare word "Success",
+# so a local service babbling "success" cannot forge a RELAY verdict.
+# Rejected: example.com (RFC 2606, NXDOMAINs on some networks) and
+# neverssl.com (TCP-unreachable on at least one real ISP).
+RELAY_HOST, RELAY_PORT = "captive.apple.com", 80
+RELAY_MARKER = "<TITLE>Success</TITLE>"
 
 # ------------------------------------------------------------------- output --
 
@@ -301,6 +311,25 @@ def probe_http_connect(ip, port, host, hport, marker, timeout):
         return None, None
     finally:
         s.close()
+
+def preflight(host=RELAY_HOST, port=RELAY_PORT, marker=RELAY_MARKER, timeout=8):
+    """Can we reach the oracle directly? If not, RELAY can never be confirmed.
+
+    Validate the instrument before trusting its readings: if this target does
+    not resolve, every open relay on the network reads as clean.
+    """
+    s = socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        s.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                  f"Connection: close\r\n\r\n".encode())
+        return marker.lower().encode() in _recv_until(s, b"</html>").lower()
+    except OSError:
+        return False
+    finally:
+        s.close()
+
 
 def probe_proxy(ip, port, host=RELAY_HOST, hport=RELAY_PORT,
                 marker=RELAY_MARKER, timeout=5):
@@ -555,6 +584,15 @@ def cmd_scan(a, o: Out):
         if not targets:
             o.bad(f"no hosts found on {base}.0/24 - try --sweep")
             return 1
+
+    if preflight(a.relay_host, a.relay_port, a.relay_marker):
+        o.ok(f"relay oracle reachable ({a.relay_host}) - RELAY can be confirmed")
+    else:
+        o.bad(f"CANNOT REACH {a.relay_host}:{a.relay_port}, or it did not return "
+              f"{a.relay_marker!r}.")
+        o.info("Open relays will NOT be confirmed - every result below reads clean")
+        o.info("whether it is or not. Fix your connection, or pick a reachable")
+        o.info("plain-HTTP target: --relay-host H --relay-port P --relay-marker TEXT")
 
     cache = load_oui_cache()
     ports = list(range(1, 65536)) if a.full else PROXY_PORTS

@@ -46,6 +46,11 @@ def http_relay(s):                      # a genuine forward proxy
         s.sendall(PAGE)
 
 
+def http_relay_root(s):                 # serves the marker on a plain GET /
+    if s.recv(4096).startswith(b"GET "):
+        s.sendall(PAGE)
+
+
 def fake_200(s):                        # the Alexa/NRDP false positive
     while True:
         if not s.recv(4096):
@@ -87,6 +92,14 @@ def main():
 
     v, d = probe(serve(socks5(relay=False)))
     assert v == "GATED", f"refusing SOCKS5 must be GATED, got {v} {d}"
+
+    # --- preflight: the oracle must be validated before it is trusted ---
+    # A reachable target serving the marker => usable. Anything else => not,
+    # because an unreachable oracle turns every open relay into a clean result.
+    port = serve(http_relay_root)
+    assert E.preflight("127.0.0.1", port, MARKER) is True
+    assert E.preflight("127.0.0.1", port, "marker-that-is-absent") is False
+    assert E.preflight("127.0.0.1", 1, MARKER) is False, "closed port must fail"
 
     # --- beacon detection ---------------------------------------------
     t0 = 1_700_000_000
