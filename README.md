@@ -82,7 +82,33 @@ then runs **beacon detection** over the timestamps: fixed-interval callbacks loo
 nothing like human browsing, so anything hitting the same host every *n* minutes
 with low variance gets flagged with its period.
 
-### 4. `monitor` — live per-client bandwidth
+### 4. `tv` — what is actually installed on the TV
+
+```bash
+exitcheck tv 192.168.1.25          # TV must be switched ON
+```
+
+The network cannot see which apps a TV has installed, and that is exactly where
+the SDKs live. This reads the app list over the TV's own control API (webOS
+SSAP, Tizen remote channel) and flags apps whose **publisher** has a documented
+proxy-monetisation record — PlayWorks, CloudTV, Longvision, Bright Data, Castar,
+Massive, Honeygain/Oxylabs.
+
+First run shows a pairing prompt on the TV; accept it with the remote and the
+key is cached. Exit code `2` if anything is flagged.
+
+A flag identifies the **publisher**, not the build on your TV, and is not
+evidence the device is relaying — confirm that with `scan` and the upload
+ratios in `router`. Matching is on vendor and app ID only, never the title, so
+an app called "Massive Attack Radio" is not the Massive SDK.
+
+There is deliberately **no unauthenticated fallback** for Tizen. The per-app
+status endpoint can only confirm IDs you already know, and published ID lists
+cover mainstream streaming apps rather than the small-publisher games that
+carry the SDKs — a check that cannot see the risky category would only
+manufacture false reassurance.
+
+### 5. `monitor` — live per-client bandwidth
 
 ```bash
 python3 exitcheck.py monitor --duration 300

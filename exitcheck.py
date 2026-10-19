@@ -15,12 +15,14 @@ Stdlib only, no pip install. Scan only networks you own or are authorised to tes
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures as cf
 import hashlib
 import json
 import os
 import re
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -346,6 +348,225 @@ def probe_proxy(ip, port, host=RELAY_HOST, hport=RELAY_PORT,
             if v == want:
                 return v, d
     return "NONE", ""
+
+# ------------------------------------------------------------------ tv apps --
+# The network cannot see which apps a TV has installed, and that is where the
+# proxy SDKs live. Only the TV can tell you, over its own control API.
+
+# Publishers named in public research as monetising user devices as residential
+# proxy exit nodes, plus the SDK vendors themselves. A match means "this app
+# comes from a publisher with a documented track record" - NOT that this build
+# contains an SDK, and NOT that it is relaying. Treat it as a reason to look.
+PROXYWARE_PUBLISHERS = {
+    "playworks": "named in Spur research as monetising devices as proxy exit nodes",
+    "cloudtv": "named in Spur research as monetising devices as proxy exit nodes",
+    "longvision": "named in Spur research as monetising devices as proxy exit nodes",
+    "brightdata": "Bright Data - residential proxy network, consumer SDK",
+    "bright data": "Bright Data - residential proxy network, consumer SDK",
+    "bright sdk": "Bright Data consumer SDK",
+    "brd": "Bright Data SDK artefact prefix",
+    "castar": "Castar SDK - residential proxy",
+    "massive": "Massive - residential proxy SDK",
+    "honeygain": "Honeygain (Oxylabs) - bandwidth monetisation SDK",
+    "oxylabs": "Oxylabs - residential proxy network",
+}
+
+TV_CACHE = os.path.expanduser("~/.cache/exitcheck/tv")
+
+
+def flag_app(app):
+    """Does this app come from a publisher with a proxy-monetisation record?"""
+    # vendor + app id only. Titles are marketing text: an app called
+    # "Massive Attack Radio" is not the Massive proxy SDK.
+    hay = " ".join(str(app.get(k) or "") for k in ("vendor", "id", "appId")).lower()
+    for pub, why in PROXYWARE_PUBLISHERS.items():
+        if pub == "brd":
+            if ".brd." in hay or hay.startswith("brd.") or "brd_sdk" in hay:
+                return pub, why
+        elif pub in hay:
+            return pub, why
+    return None, None
+
+
+def _tv_token(key, val=None):
+    os.makedirs(TV_CACHE, exist_ok=True)
+    f = os.path.join(TV_CACHE, key)
+    if val is None:
+        try:
+            return open(f).read().strip()
+        except OSError:
+            return None
+    open(f, "w").write(val)
+    return val
+
+
+class WS:
+    """Minimal RFC 6455 text-frame client. Enough for TV control APIs."""
+
+    def __init__(self, host, port, path, tls=False, timeout=40):
+        self.s = socket.create_connection((host, port), timeout)
+        self.s.settimeout(timeout)
+        if tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE      # TVs ship self-signed certs
+            self.s = ctx.wrap_socket(self.s)
+        k = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {k}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n".encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            d = self.s.recv(4096)
+            if not d:
+                raise ConnectionError("closed during handshake")
+            buf += d
+        if b" 101" not in buf.split(b"\r\n")[0]:
+            raise ConnectionError("websocket upgrade refused")
+        self.buf = buf.split(b"\r\n\r\n", 1)[1]
+
+    def send(self, obj):
+        p = json.dumps(obj).encode()
+        n = len(p)
+        hdr = b"\x81" + (bytes([0x80 | n]) if n < 126 else
+                         b"\xfe" + struct.pack(">H", n) if n < 65536 else
+                         b"\xff" + struct.pack(">Q", n))
+        m = os.urandom(4)
+        self.s.sendall(hdr + m + bytes(c ^ m[i % 4] for i, c in enumerate(p)))
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            d = self.s.recv(65536)
+            if not d:
+                raise ConnectionError("closed")
+            self.buf += d
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def recv(self):
+        while True:
+            h = self._read(2)
+            op, n = h[0] & 0x0F, h[1] & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            body = self._read(n)
+            if op == 8:
+                raise ConnectionError("closed by TV")
+            if op in (1, 2):
+                return json.loads(body.decode("utf-8", "replace"))
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def lg_apps(ip, timeout=60):
+    """webOS SSAP. First run shows a pairing prompt on the TV."""
+    key = _tv_token(f"lg-{ip}")
+    payload = {"forcePairing": False, "pairingType": "PROMPT",
+               "manifest": {"manifestVersion": 1, "appVersion": "1.0",
+                            "signed": {"created": "20260101",
+                                       "appId": "com.exitcheck.app",
+                                       "vendorId": "com.exitcheck",
+                                       "localizedAppNames": {"": "exitcheck"},
+                                       "permissions": ["LAUNCH", "READ_INSTALLED_APPS"]},
+                            "permissions": ["LAUNCH", "READ_INSTALLED_APPS"]}}
+    if key:
+        payload["client-key"] = key
+    w = WS(ip, 3000, "/", timeout=timeout)
+    w.send({"type": "register", "id": "r0", "payload": payload})
+    end = time.time() + timeout
+    while time.time() < end:
+        m = w.recv()
+        if m.get("type") == "error":
+            w.close()
+            raise RuntimeError(m.get("error"))
+        if m.get("type") == "registered":
+            k = (m.get("payload") or {}).get("client-key")
+            if k:
+                _tv_token(f"lg-{ip}", k)
+            break
+    w.send({"type": "request", "id": "a0",
+            "uri": "ssap://com.webos.applicationManager/listApps"})
+    end = time.time() + 30
+    while time.time() < end:
+        m = w.recv()
+        if m.get("id") == "a0":
+            w.close()
+            return (m.get("payload") or {}).get("apps", [])
+    w.close()
+    return []
+
+
+def samsung_apps(ip, timeout=45):
+    """Tizen remote-control channel. Needs an on-screen OK within ~30s.
+
+    No unauthenticated fallback on purpose. The per-app status endpoint can
+    only confirm app IDs you already know, and published ID lists cover
+    mainstream streaming apps - not the small-publisher games that carry the
+    SDKs. A check that cannot see the risky category would only manufacture
+    false reassurance.
+    """
+    name = base64.b64encode(b"exitcheck").decode()
+    tok = _tv_token(f"samsung-{ip}")
+    path = f"/api/v2/channels/samsung.remote.control?name={name}"
+    if tok:
+        path += f"&token={tok}"
+    w = WS(ip, 8002, path, tls=True, timeout=timeout)
+    end = time.time() + timeout
+    while time.time() < end:
+        m = w.recv()
+        ev = m.get("event")
+        if ev == "ms.channel.unauthorized":
+            w.close()
+            raise RuntimeError("TV denied the connection")
+        if ev == "ms.channel.timeOut":
+            w.close()
+            raise RuntimeError(
+                "no one acknowledged the prompt within 30s. On the TV: Settings > "
+                "General > External Device Manager > Device Connection Manager - set "
+                "Access Notification to 'First Time Only', and delete any denied "
+                "'exitcheck' entry from Device List")
+        if ev == "ms.channel.connect":
+            t = (m.get("data") or {}).get("token")
+            if t:
+                _tv_token(f"samsung-{ip}", t)
+            break
+    w.send({"method": "ms.channel.emit",
+            "params": {"event": "ed.installedApp.get", "to": "host"}})
+    end = time.time() + 25
+    while time.time() < end:
+        m = w.recv()
+        if m.get("event") == "ed.installedApp.get":
+            w.close()
+            return (m.get("data") or {}).get("data", [])
+    w.close()
+    return []
+
+
+def detect_tv(ip, timeout=3):
+    """Which control API is this TV speaking?"""
+    def open_(p):
+        s = socket.socket()
+        s.settimeout(timeout)
+        try:
+            s.connect((ip, p))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+    if open_(3000) or open_(3001):
+        return "lg"
+    if open_(8002) or open_(8001):
+        return "samsung"
+    return None
+
 
 # ----------------------------------------------------------- router backend --
 # Adding a router = one class with hosts()/config()/clients()/fetch_log().
@@ -746,6 +967,64 @@ def cmd_log(a, o: Out):
     o.info("domain that resolves fine will never appear here. Absence is weak evidence.")
     return 0
 
+def cmd_tv(a, o: Out):
+    kind = a.platform or detect_tv(a.ip)
+    if not kind:
+        o.bad(f"no TV control API answering on {a.ip} (tried 3000/3001 webOS, "
+              f"8001/8002 Tizen).")
+        o.info("The TV is probably in standby. Turn it on and try again.")
+        return 1
+    o.head(f"{a.ip} - {'LG webOS' if kind == 'lg' else 'Samsung Tizen'}")
+    o.info("Accept the prompt on the TV if one appears (first run only).")
+    try:
+        apps = (lg_apps if kind == "lg" else samsung_apps)(a.ip)
+    except (RuntimeError, ConnectionError, OSError) as e:
+        o.bad(f"could not read the app list: {e}")
+        return 1
+    if not apps:
+        o.warn("the TV returned no apps")
+        return 1
+
+    user = [x for x in apps if not x.get("systemApp")]
+    flagged = [(x, *flag_app(x)) for x in user]
+    hits = [(x, p, w) for x, p, w in flagged if p]
+
+    o.info(f"{len(apps)} apps installed, {len(user)} non-system")
+    if a.json:
+        print(json.dumps(apps, indent=1, ensure_ascii=False))
+        return 2 if hits else 0
+
+    print()
+    for x in sorted(user, key=lambda y: (y.get("title") or y.get("name") or "").lower()):
+        title = (x.get("title") or x.get("name") or "?")[:32]
+        vendor = (x.get("vendor") or "")[:22]
+        pub, why = flag_app(x)
+        if pub:
+            o.bad(f"{title:34} {vendor:24} <- {pub}")
+        else:
+            print(f"      {title:34} {vendor}")
+
+    o.head("Result")
+    if hits:
+        o.bad(f"{len(hits)} app(s) from publishers with a proxy-monetisation record:")
+        seen = set()
+        for _, pub, why in hits:
+            if pub not in seen:
+                seen.add(pub)
+                o.info(f"  {pub}: {why}")
+        o.info("")
+        o.info("This identifies the PUBLISHER, not the build on your TV, and it is")
+        o.info("not evidence the device is relaying - check that with `scan` and the")
+        o.info("upload ratios in `router`. The SDKs are usually opt-in behind an")
+        o.info("in-app 'no ads if you share resources' dialog. If you do not use")
+        o.info("these apps, removing them closes the question.")
+    else:
+        o.ok("no app from a publisher on the known list")
+        o.info("The list only covers publishers named in public research, so this")
+        o.info("is not a clean bill of health - just no known-bad name present.")
+    return 2 if hits else 0
+
+
 def cmd_monitor(a, o: Out):
     r = connect_router(a, o)
     if not r:
@@ -827,6 +1106,14 @@ def main(argv=None):
     s.add_argument("--save", help="write the fetched log here")
     router_args(s)
     s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("tv", help="list a smart TV's installed apps and flag "
+                                   "publishers with a proxy-monetisation record")
+    s.add_argument("ip", help="the TV's address (it must be switched ON)")
+    s.add_argument("--platform", choices=["lg", "samsung"],
+                   help="skip autodetection")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_tv)
 
     s = sub.add_parser("monitor", help="live per-client bandwidth")
     s.add_argument("--duration", type=int, default=300)

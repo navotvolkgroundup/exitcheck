@@ -6,7 +6,7 @@ exact false positive that motivated the design - a service that answers
 "200 OK" to CONNECT without being a proxy at all (Amazon's Alexa stack does
 this on port 9080). If that ever classifies as RELAY again, this fails.
 """
-import socket, struct, threading, time
+import base64, socket, struct, threading, time
 import exitcheck as E
 
 MARKER = "Example Domain"
@@ -75,6 +75,47 @@ def socks5(relay: bool):
     return h
 
 
+def ws_echo(s):
+    """Server side of RFC 6455, just enough to echo one client's text frames."""
+    import hashlib
+    req = b""
+    while b"\r\n\r\n" not in req:
+        d = s.recv(4096)
+        if not d:
+            return
+        req += d
+    key = next(l.split(b": ", 1)[1] for l in req.split(b"\r\n")
+               if l.lower().startswith(b"sec-websocket-key"))
+    acc = base64.b64encode(hashlib.sha1(
+        key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()).decode()
+    s.sendall(f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+              f"Connection: Upgrade\r\nSec-WebSocket-Accept: {acc}\r\n\r\n".encode())
+    buf = b""
+    while True:
+        d = s.recv(65536)
+        if not d:
+            return
+        buf += d
+        while len(buf) >= 2:
+            n, off = buf[1] & 0x7F, 2
+            if n == 126:
+                n = struct.unpack(">H", buf[2:4])[0]; off = 4
+            elif n == 127:
+                n = struct.unpack(">Q", buf[2:10])[0]; off = 10
+            masked = buf[1] & 0x80
+            need = off + (4 if masked else 0) + n
+            if len(buf) < need:
+                break
+            m = buf[off:off + 4] if masked else b"\x00\x00\x00\x00"
+            body = bytes(c ^ m[i % 4] for i, c in
+                         enumerate(buf[off + 4:off + 4 + n] if masked
+                                   else buf[off:off + n]))
+            buf = buf[need:]
+            hdr = b"\x81" + (bytes([len(body)]) if len(body) < 126
+                             else b"\x7e" + struct.pack(">H", len(body)))
+            s.sendall(hdr + body)          # server frames are unmasked
+
+
 def probe(port):
     return E.probe_proxy("127.0.0.1", port, "127.0.0.1", 80, MARKER, timeout=3)
 
@@ -132,6 +173,27 @@ def main():
     assert [h[1] for h in r["proxyware"]] == ["getgrass.io"], r["proxyware"]
     assert len(r["wifi_auth_failures"]) == 1
     assert any(dom == "x.getgrass.io" and abs(p - 3600) < 1 for dom, _, p, _ in r["beacons"])
+
+    # --- publisher flagging: vendor/appId only, never the title ----------
+    assert E.flag_app({"title": "Pac-Man", "vendor": "PlayWorks Digital",
+                       "id": "com.playworks.app.pacman"})[0] == "playworks"
+    assert E.flag_app({"title": "X", "vendor": "Bright Data Ltd",
+                       "id": "com.x"})[0] == "bright data"
+    assert E.flag_app({"title": "Netflix", "vendor": "LG", "id": "netflix"})[0] is None
+    # a title must never trigger a flag on its own
+    assert E.flag_app({"title": "Massive Attack Radio", "vendor": "Indie Label",
+                       "id": "com.indie.radio"})[0] is None, "title must not match"
+    assert E.flag_app({"title": "Honeygain", "vendor": "", "id": ""})[0] is None
+
+    # --- websocket client: handshake + masked frame round trip -----------
+    port = serve(ws_echo)
+    w = E.WS("127.0.0.1", port, "/", timeout=10)
+    w.send({"hello": "tv"})
+    assert w.recv() == {"hello": "tv"}
+    big = {"pad": "x" * 500}          # exercises the 16-bit length path
+    w.send(big)
+    assert w.recv() == big
+    w.close()
 
     # --- ratio heuristic -------------------------------------------------
     assert E.ratio_verdict(20_000_000_000, 2_000_000_000)[0] == "normal"
