@@ -383,7 +383,11 @@ class Sagemcom:
         maps = [m for m in (self.get("Device/NAT/PortMappings", 3) or [])
                 if isinstance(m, dict) and m.get("Enable")]
         ra = (self.get("Device/UserInterface/RemoteAccess", 3) or {}).get("RemoteAccess", {})
+        wan = self.get("Device/IP/Interfaces/Interface[Alias='IP_DATA']/IPv4Addresses", 3) or []
+        wan_ip = next((a.get("IPAddress") for a in wan if isinstance(a, dict) and a.get("IPAddress")), None)
+        wan_type = next((a.get("AddressingType") for a in wan if isinstance(a, dict)), None)
         return {"dns_servers": dns, "port_forwards": maps,
+                "wan_ip": wan_ip, "wan_type": wan_type,
                 "remote_access": bool(ra.get("Enable")),
                 "firewall": self.get("Device/Firewall/Config"),
                 "upnp": (self.get("Device/UPnP/Device", 2) or {}).get("Device", {}).get("UPnPIGD"),
@@ -621,6 +625,11 @@ def cmd_router(a, o: Out):
         o.bad("remote management is ENABLED - the admin UI is reachable from the internet")
     else:
         o.ok("remote management disabled")
+    if cfg.get("wan_ip"):
+        o.info(f"WAN address: {cfg['wan_ip']} ({cfg.get('wan_type')})")
+        if cfg.get("wan_type") in ("IPCP", "DHCPv4"):
+            o.info("  ^ assigned, so it can change. Anything pinned to this IP"
+                   " (filtering DNS, allowlists) breaks silently when it does.")
     dns = cfg["dns_servers"]
     o.info(f"DNS servers in use: {', '.join(dns) or 'none reported'}")
     o.info("  ^ confirm these belong to your ISP. Rewritten DNS is the classic router hijack.")
