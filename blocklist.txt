@@ -1,0 +1,46 @@
+! Title: exitcheck proxyware blocklist
+! Description: Control/telemetry endpoints for residential-proxy and proxyware SDKs
+!   (Bright Data, Hola, Castar, Honeygain, IPRoyal, PacketStream and friends).
+!   These are what a Smart TV or phone app contacts when it is being used as
+!   someone else's exit node. Blocking them breaks the relay, not the app.
+! Generated: 2026-10-19 from exitcheck PROXYWARE_DOMAINS (37 entries)
+! Syntax: Adblock-style. Works in AdGuard Home and Pi-hole v6 adlists.
+!   Each rule blocks the domain AND all its subdomains.
+!
+||922proxy.com^
+||bright-sdk.com^
+||brightdata.com^
+||brightsdk.com^
+||castar.io^
+||castarsdk.com^
+||earnapp.com^
+||getgrass.io^
+||grass.io^
+||hola.net^
+||hola.org^
+||holavpn.net^
+||honeygain.com^
+||honeygain.net^
+||infatica.io^
+||ipidea.net^
+||iproyal.com^
+||lum-superproxy.io^
+||luminati.io^
+||mysterium.network^
+||netnut.io^
+||nodemaven.com^
+||nsocks.net^
+||oxylabs.io^
+||packetstream.io^
+||pawns.app^
+||peer2profit.com^
+||peer2profit.io^
+||proxyrack.com^
+||proxyrack.net^
+||rayobyte.com^
+||repocket.co^
+||smartproxy.com^
+||soax.com^
+||superproxy.io^
+||traffmonetizer.com^
+||webshare.io^

@@ -82,6 +82,20 @@ python3 exitcheck.py monitor --duration 300
 Per-client up/down rates against the WAN total, so you can see who is actually
 using the line right now.
 
+## Blocklists
+
+`blocklist.txt` is generated from `PROXYWARE_DOMAINS` and blocks the control
+endpoints these SDKs call home to. Blocking them breaks the relay, not the app.
+
+| file | for |
+|---|---|
+| `blocklist.txt` | AdGuard Home, Pi-hole v6 (Adblock syntax, covers subdomains) |
+| `blocklist-plain.txt` | NextDNS / Control D denylist (bare domains, paste in) |
+| `blocklist-pihole-regex.txt` | Pi-hole v5 regex table |
+
+Regenerate after editing `PROXYWARE_DOMAINS`: see the snippet in `CONTRIBUTING`
+or just re-run the three-line generator in the project history.
+
 ## Honest limits
 
 Read these before trusting a clean result.
