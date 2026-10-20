@@ -6,7 +6,7 @@ exact false positive that motivated the design - a service that answers
 "200 OK" to CONNECT without being a proxy at all (Amazon's Alexa stack does
 this on port 9080). If that ever classifies as RELAY again, this fails.
 """
-import base64, socket, struct, threading, time
+import base64, os, socket, struct, threading, time
 import exitcheck as E
 
 MARKER = "Example Domain"
@@ -194,6 +194,44 @@ def main():
     w.send(big)
     assert w.recv() == big
     w.close()
+
+    # --- .env parsing -----------------------------------------------------
+    import tempfile
+    d = tempfile.mkdtemp()
+    f = os.path.join(d, ".env")
+    with open(f, "w") as fh:
+        fh.write("# a comment\n\nEXITCHECK_USER=root\n"
+                 'EXITCHECK_PASSWORD="pa ss#1"\n'
+                 "EXITCHECK_ROUTER='10.0.0.1'\nNOT_AN_ASSIGNMENT\n")
+    for k in ("EXITCHECK_USER", "EXITCHECK_PASSWORD", "EXITCHECK_ROUTER"):
+        os.environ.pop(k, None)
+    assert E.load_env(f) == [f]
+    assert os.environ["EXITCHECK_USER"] == "root"
+    assert os.environ["EXITCHECK_PASSWORD"] == "pa ss#1", "quotes stripped, # kept"
+    assert os.environ["EXITCHECK_ROUTER"] == "10.0.0.1"
+    os.environ["EXITCHECK_USER"] = "fromshell"      # real env must win
+    E.load_env(f)
+    assert os.environ["EXITCHECK_USER"] == "fromshell"
+    for k in ("EXITCHECK_USER", "EXITCHECK_PASSWORD", "EXITCHECK_ROUTER"):
+        os.environ.pop(k, None)
+
+    # --- backend contract -------------------------------------------------
+    base = E.Router("10.0.0.1")
+    for meth, args in (("hosts", ()), ("config", ()), ("clients", ()),
+                       ("counters", ([],)), ("fetch_log", ())):
+        try:
+            getattr(base, meth)(*args)
+            raise AssertionError(f"{meth} must raise Unsupported, not succeed")
+        except E.Unsupported:
+            pass
+    for name, cls in E.ROUTERS.items():
+        assert cls.name == name, f"registry key {name} != {cls.name}"
+        assert isinstance(cls.verified, bool)
+        assert cls.default_user
+    # verified must be earned, not assumed
+    assert E.ROUTERS["sagemcom"].verified and E.ROUTERS["upnp"].verified
+    assert not E.ROUTERS["mikrotik"].verified
+    assert E.ROUTERS["upnp"].needs_auth is False, "UPnP must work without creds"
 
     # --- ratio heuristic -------------------------------------------------
     assert E.ratio_verdict(20_000_000_000, 2_000_000_000)[0] == "normal"

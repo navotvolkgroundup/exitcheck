@@ -155,19 +155,59 @@ Read these before trusting a clean result.
 
 ## Router support
 
-`router`, `log` and `monitor` need a backend. `scan` does not and works anywhere.
+`scan` and `tv` need no router at all. `router`, `log` and `monitor` use a
+backend, and backends support *different subsets* — commands say so and carry
+on rather than failing.
 
-| backend | status |
-|---|---|
-| `sagemcom` | working — tested on F@st 5657 GPON |
+| backend | auth | status | gives you |
+|---|---|---|---|
+| `sagemcom` | yes | **verified on hardware** (F@st 5657 GPON) | everything: config, per-client counters, logs |
+| `upnp` | **no** | **verified on hardware** | WAN IP + port mappings, on almost any router |
+| `openwrt` | yes | from vendor docs, **untested** | DHCP leases, WAN address |
+| `fritzbox` | yes | from vendor docs, **untested** | host list, WAN address (TR-064) |
+| `asuswrt` | yes | from vendor docs, **untested** | client list, WAN link |
+| `mikrotik` | yes | from vendor docs, **untested** | DHCP leases, addresses (RouterOS v7 REST) |
 
-Adding one is a single class with `hosts()`, `config()`, `clients()`, `counters()`
-and `fetch_log()`. See `Sagemcom` and add it to `ROUTERS`. PRs very welcome —
-**so are additions to `PROXYWARE_DOMAINS`**, which is the part of this project with
-the shortest shelf life.
+```bash
+exitcheck --list-backends
+```
 
-Credentials come from `--password`, `$EXITCHECK_PASSWORD`, or an interactive prompt.
-Nothing is written to disk except the OUI cache and any log you ask it to `--save`.
+**"Untested" is meant literally.** Those four are written from published vendor
+documentation and have never been run against the real device — the author owns
+one router. The tool prints a warning when you use one. If you run one
+successfully, say so in an issue and it gets promoted; if it breaks, that is a
+bug worth reporting, not a surprise.
+
+**Start with `upnp` if your router is not listed.** It is a standard protocol,
+needs no credentials, and an unexpected port mapping is one of the few
+router-level findings that actually matters — UPnP is how malware adds one.
+
+Backends are autodetected by default. Detection tries the vendor backends first
+and falls back to UPnP, which answers almost everywhere but exposes far less.
+
+## Credentials
+
+Put them in a file, not your shell history:
+
+```bash
+cp .env.example .env     # .env is git-ignored
+exitcheck router
+```
+
+```ini
+EXITCHECK_ROUTER=192.168.1.1
+EXITCHECK_TYPE=auto
+EXITCHECK_USER=admin
+EXITCHECK_PASSWORD=secret
+```
+
+Read from `--env-file`, then `./.env`, then `~/.exitcheck.env`. Real environment
+variables always win over the file. With no password anywhere you are prompted;
+`--password` exists but puts the secret in your shell history and `ps` output.
+
+Adding a backend is one class with `hosts()`, `config()`, `clients()`,
+`counters()` and `fetch_log()` — implement what the device exposes and let the
+rest raise `Unsupported`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Tests
 

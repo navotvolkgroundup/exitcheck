@@ -37,7 +37,20 @@ A backend is one class with five methods:
 | `counters(targets)` | `{mac: (down_bytes, up_bytes)}` plus `"WAN"` |
 | `fetch_log()` | the router's log as text, or `None` |
 
-Then add it to `ROUTERS`. Copy `Sagemcom` and work from there.
+Subclass `Router`, set `name`, and add it to `ROUTERS` (the registry is built
+from the classes, so the name is the key). Implement only what the device
+exposes — everything else inherits a method that raises `Unsupported`, and the
+commands degrade with a clear line instead of crashing.
+
+Set `verified = True` **only** once you have run it against the real device.
+Backends written from documentation stay `False` and the tool warns the user.
+That flag is a promise, not a default.
+
+`login()` must actually contact the device. A `login()` that only prepares
+credentials always succeeds, and then it wins autodetection on every router it
+is not. That exact bug shipped once.
+
+Set `needs_auth = False` if no credentials are required (see `UPnP`).
 
 **Mind the direction convention.** Access-point stats are usually from the AP's
 point of view, so "bytes sent" is AP→client, which is the client's *download*.

@@ -6,3 +6,8 @@ build/
 dist/
 *.egg-info/
 .venv/
+
+# never commit credentials
+.env
+.env.*
+!.env.example

@@ -27,8 +27,10 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 __version__ = "0.1.0"
@@ -568,20 +570,110 @@ def detect_tv(ip, timeout=3):
     return None
 
 
+# ------------------------------------------------------------- credentials --
+
+ENV_FILES = (".env", os.path.expanduser("~/.exitcheck.env"))
+
+
+def load_env(path=None):
+    """Read KEY=VALUE lines into os.environ. Existing vars always win.
+
+    Looked for in: --env-file, ./.env, ~/.exitcheck.env. Keeps router
+    passwords out of your shell history and off the process list.
+    """
+    loaded = []
+    for f in ([path] if path else ENV_FILES):
+        if not f or not os.path.isfile(f):
+            continue
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    os.environ.setdefault(k, v)       # real env wins
+            loaded.append(f)
+        except OSError:
+            pass
+        if path:
+            break
+    return loaded
+
+
 # ----------------------------------------------------------- router backend --
+
+class Unsupported(Exception):
+    """This backend cannot do this. Commands degrade instead of crashing."""
+
+
+class Router:
+    """Backend contract. Implement what the device actually exposes.
+
+    `verified` means someone ran it against real hardware. Backends written
+    from vendor documentation start False and say so in the output - this
+    tool should never imply a check it has not actually performed.
+    """
+    name = "?"
+    verified = False
+    needs_auth = True
+    default_user = "admin"
+
+    def __init__(self, host, user=None, password=None, **kw):
+        self.host = host if "://" in host else "http://" + host
+        self.hostname = self.host.split("://", 1)[1].split("/")[0].split(":")[0]
+        self.user, self.password = user, password
+
+    def login(self):
+        return self
+
+    def hosts(self):
+        raise Unsupported("device list")
+
+    def config(self):
+        raise Unsupported("configuration audit")
+
+    def clients(self):
+        raise Unsupported("wifi client list")
+
+    def counters(self, targets):
+        raise Unsupported("per-client byte counters")
+
+    def fetch_log(self):
+        raise Unsupported("log retrieval")
+
+    # -- helpers shared by the HTTP backends -------------------------------
+    def _get(self, url, timeout=15, headers=None, data=None, opener=None):
+        req = urllib.request.Request(url, data=data, headers=headers or {})
+        o = opener or urllib.request.build_opener()
+        with o.open(req, timeout=timeout) as r:
+            return r.read()
+
+    def _json(self, url, payload, timeout=15, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return json.loads(self._get(url, timeout, h, json.dumps(payload).encode()))
+
+
 # Adding a router = one class with hosts()/config()/clients()/fetch_log().
 # Sagemcom is implemented because that is what the author owns.
 
-class Sagemcom:
-    """Sagemcom F@st (/cgi/json-req). Tested on F@st 5657 GPON."""
+class Sagemcom(Router):
+    """Sagemcom F@st (/cgi/json-req)."""
     name = "sagemcom"
+    verified = True          # run against an F@st 5657 GPON
+    default_user = "admin"
 
-    def __init__(self, host, user, password, sha512=False):
-        self.base = host if host.startswith("http") else "http://" + host
-        self.user, self.rid, self.sid, self.nonce = user, 0, "0", ""
+    def __init__(self, host, user=None, password=None, sha512=False, **kw):
+        super().__init__(host, user, password)
+        self.base = self.host
+        self.rid, self.sid, self.nonce = 0, "0", ""
         self._h = (lambda s: hashlib.sha512(s.encode()).hexdigest()) if sha512 else \
                   (lambda s: hashlib.md5(s.encode()).hexdigest())
-        self.hpw = self._h(password)
+        self.hpw = self._h(password or "")
 
     def _post(self, actions):
         import random
@@ -694,7 +786,373 @@ class Sagemcom:
         with urllib.request.urlopen(self.base + uri, timeout=120) as r:
             return r.read().decode("utf-8", "replace")
 
-ROUTERS = {"sagemcom": Sagemcom}
+class UPnP(Router):
+    """Generic UPnP IGD. No credentials, works on a large share of consumer
+    routers. Only exposes what IGD defines: external IP and port mappings.
+
+    Worth running everywhere: an unexpected port mapping is one of the few
+    router-level findings that matters, and UPnP is how malware adds one.
+    """
+    name = "upnp"
+    verified = True          # run against a Sagemcom F@st 5657
+    needs_auth = False
+    NS = {"d": "urn:schemas-upnp-org:device-1-0"}
+    WAN = ("urn:schemas-upnp-org:service:WANIPConnection:1",
+           "urn:schemas-upnp-org:service:WANPPPConnection:1")
+
+    def __init__(self, host, user=None, password=None, **kw):
+        super().__init__(host, user, password)
+        self.ctrl = self.svc = None
+
+    @staticmethod
+    def discover(timeout=3):
+        """SSDP M-SEARCH for an IGD. Returns the description URL."""
+        msg = ("M-SEARCH * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\n"
+               'MAN:"ssdp:discover"\r\nMX:2\r\n'
+               "ST:urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            s.sendto(msg.encode(), ("239.255.255.250", 1900))
+            while True:
+                data, _ = s.recvfrom(4096)
+                for line in data.decode("utf-8", "replace").split("\r\n"):
+                    if line.lower().startswith("location:"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            return None
+        finally:
+            s.close()
+
+    def _desc_urls(self):
+        found = self.discover()
+        if found and self.hostname in found:
+            yield found
+        for p in (49152, 5000, 1900, 80, 2869, 49153):
+            for path in ("/rootDesc.xml", "/description.xml", "/igd.xml",
+                         "/DeviceDescription.xml", "/upnp/IGD.xml"):
+                yield f"http://{self.hostname}:{p}{path}"
+
+    def login(self):
+        for url in self._desc_urls():
+            try:
+                xml = self._get(url, timeout=5)
+                root = ET.fromstring(xml)
+            except (OSError, ET.ParseError, ValueError, urllib.error.URLError):
+                continue
+            for svc in root.iter():
+                if not svc.tag.endswith("service"):
+                    continue
+                st = cu = None
+                for ch in svc:
+                    if ch.tag.endswith("serviceType"):
+                        st = (ch.text or "").strip()
+                    elif ch.tag.endswith("controlURL"):
+                        cu = (ch.text or "").strip()
+                if st in self.WAN and cu:
+                    base = url.rsplit("/", 1)[0]
+                    self.ctrl = cu if cu.startswith("http") else (
+                        f"http://{urllib.parse.urlparse(url).netloc}{cu}"
+                        if cu.startswith("/") else f"{base}/{cu}")
+                    self.svc = st
+                    return self
+        raise RuntimeError("no UPnP IGD WAN service found (UPnP may be off)")
+
+    def _soap(self, action, args=""):
+        body = (f'<?xml version="1.0"?><s:Envelope '
+                f'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+                f'<s:Body><u:{action} xmlns:u="{self.svc}">{args}'
+                f'</u:{action}></s:Body></s:Envelope>')
+        out = self._get(self.ctrl, 12,
+                        {"Content-Type": 'text/xml; charset="utf-8"',
+                         "SOAPAction": f'"{self.svc}#{action}"'}, body.encode())
+        return {e.tag.split("}")[-1]: (e.text or "") for e in ET.fromstring(out).iter()}
+
+    def config(self):
+        wan = None
+        try:
+            wan = self._soap("GetExternalIPAddress").get("NewExternalIPAddress")
+        except Exception:
+            pass
+        maps = []
+        for i in range(0, 64):
+            try:
+                m = self._soap("GetGenericPortMappingEntry",
+                               f"<NewPortMappingIndex>{i}</NewPortMappingIndex>")
+            except Exception:
+                break
+            if "NewExternalPort" not in m:
+                break
+            maps.append({"Alias": m.get("NewPortMappingDescription", ""),
+                         "ExternalPort": m.get("NewExternalPort"),
+                         "InternalClient": m.get("NewInternalClient"),
+                         "InternalPort": m.get("NewInternalPort"),
+                         "Protocol": m.get("NewProtocol"),
+                         "Enable": m.get("NewEnabled") == "1"})
+        return {"dns_servers": [], "port_forwards": [m for m in maps if m["Enable"]],
+                "remote_access": None, "firewall": None, "upnp": True,
+                "firmware": None, "model": "generic UPnP IGD",
+                "wan_ip": wan, "wan_type": None}
+
+
+class OpenWrt(Router):
+    """OpenWrt and derivatives (GL.iNet, Turris, ...) via ubus JSON-RPC.
+
+    Needs uhttpd-mod-ubus + an rpcd ACL granting luci-rpc read access.
+    Written from the OpenWrt ubus documentation; not yet run on hardware.
+    """
+    name = "openwrt"
+    verified = False
+    default_user = "root"
+    NULL = "00000000000000000000000000000000"
+
+    def __init__(self, host, user=None, password=None, **kw):
+        super().__init__(host, user, password)
+        self.sid = None
+
+    def _call(self, obj, method, params=None, sid=None):
+        r = self._json(self.host + "/ubus", {
+            "jsonrpc": "2.0", "id": 1, "method": "call",
+            "params": [sid or self.sid or self.NULL, obj, method, params or {}]})
+        if "error" in r:
+            raise RuntimeError(r["error"].get("message", "ubus error"))
+        res = r.get("result") or []
+        if len(res) > 1:
+            return res[1]
+        if res and res[0] not in (0, None):
+            raise RuntimeError(f"ubus status {res[0]} on {obj}.{method}")
+        return {}
+
+    def login(self):
+        d = self._call("session", "login",
+                       {"username": self.user or self.default_user,
+                        "password": self.password or ""}, sid=self.NULL)
+        self.sid = d.get("ubus_rpc_session")
+        if not self.sid:
+            raise RuntimeError("ubus login failed")
+        return self
+
+    def hosts(self):
+        out, seen = [], set()
+        d = self._call("luci-rpc", "getDHCPLeases")
+        for fam in ("dhcp_leases", "dhcp6_leases"):
+            for l in d.get(fam) or []:
+                mac = (l.get("macaddr") or "").upper()
+                if not mac or mac in seen:
+                    continue
+                seen.add(mac)
+                out.append({"mac": mac, "ip": l.get("ipaddr") or l.get("ip6addr") or "",
+                            "name": l.get("hostname") or "", "active": True,
+                            "iface": ""})
+        return out
+
+    def config(self):
+        wan = None
+        for name in ("wan", "wan6"):
+            try:
+                st = self._call(f"network.interface.{name}", "status")
+            except RuntimeError:
+                continue
+            for a in st.get("ipv4-address") or []:
+                wan = a.get("address") or wan
+            if wan:
+                break
+        return {"dns_servers": (st.get("dns-server") if wan else []) or [],
+                "port_forwards": [], "remote_access": None, "firewall": None,
+                "upnp": None, "firmware": None, "model": "OpenWrt",
+                "wan_ip": wan, "wan_type": "dhcp"}
+
+
+class FritzBox(Router):
+    """AVM FRITZ!Box over TR-064 SOAP (port 49000, HTTP digest auth).
+
+    Written from AVM's published TR-064 documentation; not yet run on hardware.
+    """
+    name = "fritzbox"
+    verified = False
+    default_user = "admin"
+
+    def __init__(self, host, user=None, password=None, **kw):
+        super().__init__(host, user, password)
+        self.port = 49000
+        self.opener = None
+
+    def login(self):
+        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        mgr.add_password(None, f"http://{self.hostname}:{self.port}",
+                         self.user or self.default_user, self.password or "")
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPDigestAuthHandler(mgr))
+        # Must actually touch the device: a login() that only builds an opener
+        # always "succeeds" and would hijack autodetection on every router.
+        self._get(f"http://{self.hostname}:{self.port}/tr64desc.xml", 6)
+        return self
+
+    def _soap(self, path, service, action, args=""):
+        body = (f'<?xml version="1.0"?><s:Envelope '
+                f'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+                f'<s:Body><u:{action} xmlns:u="{service}">{args}'
+                f'</u:{action}></s:Body></s:Envelope>')
+        out = self._get(f"http://{self.hostname}:{self.port}{path}", 15,
+                        {"Content-Type": 'text/xml; charset="utf-8"',
+                         "SOAPAction": f"{service}#{action}"},
+                        body.encode(), opener=self.opener)
+        return {e.tag.split("}")[-1]: (e.text or "") for e in ET.fromstring(out).iter()}
+
+    def hosts(self):
+        n = int(self._soap("/upnp/control/hosts", "urn:dslforum-org:service:Hosts:1",
+                           "GetHostNumberOfEntries").get("NewHostNumberOfEntries", 0))
+        out = []
+        for i in range(n):
+            h = self._soap("/upnp/control/hosts", "urn:dslforum-org:service:Hosts:1",
+                           "GetGenericHostEntry",
+                           f"<NewIndex>{i}</NewIndex>")
+            out.append({"mac": (h.get("NewMACAddress") or "").upper(),
+                        "ip": h.get("NewIPAddress") or "",
+                        "name": h.get("NewHostName") or "",
+                        "active": h.get("NewActive") == "1",
+                        "iface": h.get("NewInterfaceType") or ""})
+        return out
+
+    def config(self):
+        svc = "urn:dslforum-org:service:WANIPConnection:1"
+        wan = self._soap("/upnp/control/wanipconnection1", svc,
+                         "GetExternalIPAddress").get("NewExternalIPAddress")
+        return {"dns_servers": [], "port_forwards": [], "remote_access": None,
+                "firewall": None, "upnp": None, "firmware": None,
+                "model": "FRITZ!Box", "wan_ip": wan, "wan_type": None}
+
+
+class AsusWrt(Router):
+    """ASUSWRT and Merlin via /login.cgi + /appGet.cgi.
+
+    Written from the documented appGet hook interface; not yet run on hardware.
+    """
+    name = "asuswrt"
+    verified = False
+    default_user = "admin"
+
+    def __init__(self, host, user=None, password=None, **kw):
+        super().__init__(host, user, password)
+        self.token = None
+
+    def login(self):
+        cred = base64.b64encode(
+            f"{self.user or self.default_user}:{self.password or ''}".encode()).decode()
+        body = urllib.parse.urlencode({"login_authorization": cred}).encode()
+        raw = self._get(self.host + "/login.cgi", 15,
+                        {"Content-Type": "application/x-www-form-urlencoded",
+                         "User-Agent": "asusrouter-Android"}, body)
+        try:
+            self.token = json.loads(raw).get("asus_token")
+        except ValueError:
+            self.token = None
+        if not self.token:
+            raise RuntimeError("ASUSWRT login failed")
+        return self
+
+    def _hook(self, hook):
+        body = urllib.parse.urlencode({"hook": hook}).encode()
+        raw = self._get(self.host + "/appGet.cgi", 20,
+                        {"Content-Type": "application/x-www-form-urlencoded",
+                         "User-Agent": "asusrouter-Android",
+                         "Cookie": f"asus_token={self.token}"}, body)
+        return json.loads(raw.decode("utf-8", "replace"))
+
+    def hosts(self):
+        data = self._hook("get_clientlist()").get("get_clientlist", {})
+        out = []
+        for mac, c in data.items():
+            if not isinstance(c, dict) or ":" not in mac:
+                continue
+            out.append({"mac": mac.upper(), "ip": c.get("ip") or "",
+                        "name": c.get("nickName") or c.get("name") or "",
+                        "active": str(c.get("isOnline")) == "1",
+                        "iface": "WiFi" if str(c.get("isWL")) not in ("0", "None")
+                                 else "Ethernet"})
+        return out
+
+    def config(self):
+        w = self._hook("wanlink()")
+        return {"dns_servers": (w.get("wanlink_dns") or "").split(),
+                "port_forwards": [], "remote_access": None, "firewall": None,
+                "upnp": None, "firmware": None, "model": "ASUSWRT",
+                "wan_ip": w.get("wanlink_ipaddr"), "wan_type": w.get("wanlink_type")}
+
+
+class MikroTik(Router):
+    """MikroTik RouterOS v7 REST API (https, basic auth).
+
+    Written from MikroTik's REST documentation; not yet run on hardware.
+    """
+    name = "mikrotik"
+    verified = False
+    default_user = "admin"
+
+    def __init__(self, host, user=None, password=None, **kw):
+        super().__init__(host, user, password)
+        if self.host.startswith("http://"):
+            self.host = "https://" + self.host[len("http://"):]
+
+    def _rest(self, path):
+        cred = base64.b64encode(
+            f"{self.user or self.default_user}:{self.password or ''}".encode()).decode()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE          # RouterOS ships a self-signed cert
+        o = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        return json.loads(self._get(self.host + path, 15,
+                                    {"Authorization": "Basic " + cred}, opener=o))
+
+    def login(self):
+        self._rest("/rest/system/resource")
+        return self
+
+    def hosts(self):
+        return [{"mac": (l.get("mac-address") or "").upper(),
+                 "ip": l.get("address") or "",
+                 "name": l.get("host-name") or l.get("comment") or "",
+                 "active": l.get("status") == "bound", "iface": ""}
+                for l in self._rest("/rest/ip/dhcp-server/lease")]
+
+    def config(self):
+        wan = None
+        for a in self._rest("/rest/ip/address"):
+            ip = (a.get("address") or "").split("/")[0]
+            if ip and not ip.startswith(("10.", "192.168.", "127.")):
+                wan = ip
+                break
+        return {"dns_servers": [], "port_forwards": [], "remote_access": None,
+                "firewall": None, "upnp": None, "firmware": None,
+                "model": "RouterOS", "wan_ip": wan, "wan_type": None}
+
+
+ROUTERS = {c.name: c for c in (Sagemcom, UPnP, OpenWrt, FritzBox, AsusWrt, MikroTik)}
+
+
+def detect_router(host, user=None, password=None):
+    """Probe for a backend, best first.
+
+    Credentials are passed in because the authenticated backends cannot
+    identify themselves without them - otherwise every router falls through
+    to UPnP, which answers almost everywhere but exposes far less.
+    """
+    for cls in (Sagemcom, OpenWrt, AsusWrt, FritzBox, MikroTik, UPnP):
+        if cls.needs_auth and not password:
+            continue
+        try:
+            cls(host, user or cls.default_user, password).login()
+            return cls.name
+        except Exception:
+            continue
+    try:
+        UPnP(host).login()
+        return UPnP.name
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------- analysis --
 
@@ -863,24 +1321,55 @@ def cmd_scan(a, o: Out):
     return 2 if findings else 0
 
 def connect_router(a, o: Out):
+    host = a.router or os.environ.get("EXITCHECK_ROUTER") or "192.168.1.1"
+    kind = a.type or os.environ.get("EXITCHECK_TYPE")
+    if not kind or kind == "auto":
+        o.info(f"detecting the router at {host} ...")
+        kind = detect_router(host, a.user or os.environ.get("EXITCHECK_USER"),
+                             a.password or os.environ.get("EXITCHECK_PASSWORD"))
+        if not kind:
+            o.bad(f"no supported router API answered at {host}.")
+            o.info("Supported: " + ", ".join(sorted(ROUTERS)))
+            o.info("Pass --type to skip detection, or --router to fix the address.")
+            return None
+        o.ok(f"detected: {kind}")
+    cls = ROUTERS[kind]
+    user = a.user or os.environ.get("EXITCHECK_USER") or cls.default_user
     pw = a.password or os.environ.get("EXITCHECK_PASSWORD")
-    if not pw:
+    if cls.needs_auth and not pw:
         import getpass
-        pw = getpass.getpass(f"password for {a.user}@{a.router}: ")
-    cls = ROUTERS[a.type]
+        try:
+            pw = getpass.getpass(f"password for {user}@{host}: ")
+        except (EOFError, KeyboardInterrupt):
+            o.bad("no password given")
+            return None
     try:
-        return cls(a.router, a.user, pw, sha512=a.sha512).login()
+        r = cls(host, user, pw, sha512=getattr(a, "sha512", False)).login()
     except Exception as e:
-        o.bad(f"could not log in to the router: {e}")
+        o.bad(f"could not connect via {kind}: {e}")
         return None
+    if not cls.verified:
+        o.warn(f"the '{kind}' backend is written from vendor documentation and "
+               f"has not been run against real hardware - treat output as unconfirmed")
+    return r
 
 def cmd_router(a, o: Out):
     r = connect_router(a, o)
     if not r:
         return 1
-    cfg = r.config()
+    try:
+        cfg = r.config()
+    except Unsupported as e:
+        o.warn(f"this backend cannot do a {e}")
+        cfg = None
+    except Exception as e:
+        o.bad(f"backend '{r.name}' failed reading the config: "
+              f"{type(e).__name__}: {e}")
+        cfg = None
+    if cfg is None:
+        return 1
     o.head(f"Router: {cfg.get('model')}  firmware {cfg.get('firmware')}")
-    if cfg["remote_access"]:
+    if cfg.get("remote_access"):
         o.bad("remote management is ENABLED - the admin UI is reachable from the internet")
     else:
         o.ok("remote management disabled")
@@ -889,10 +1378,11 @@ def cmd_router(a, o: Out):
         if cfg.get("wan_type") in ("IPCP", "DHCPv4"):
             o.info("  ^ assigned, so it can change. Anything pinned to this IP"
                    " (filtering DNS, allowlists) breaks silently when it does.")
-    dns = cfg["dns_servers"]
-    o.info(f"DNS servers in use: {', '.join(dns) or 'none reported'}")
-    o.info("  ^ confirm these belong to your ISP. Rewritten DNS is the classic router hijack.")
-    if cfg["port_forwards"]:
+    dns = cfg.get("dns_servers") or []
+    if dns:
+        o.info(f"DNS servers in use: {', '.join(dns)}")
+        o.info("  ^ confirm these belong to your ISP. Rewritten DNS is the classic hijack.")
+    if cfg.get("port_forwards"):
         o.warn(f"{len(cfg['port_forwards'])} enabled port forward(s)/DMZ:")
         for m in cfg["port_forwards"]:
             o.info(f"    {m.get('Alias')} ext {m.get('ExternalPort')} -> "
@@ -901,15 +1391,31 @@ def cmd_router(a, o: Out):
         o.ok("no enabled port forwards or DMZ")
     o.info(f"firewall level: {cfg.get('firewall')}   UPnP IGD: {cfg.get('upnp')}")
 
+    try:
+        tg = r.clients()
+    except Unsupported as e:
+        o.info("")
+        o.info(f"(no {e} from this backend - upload ratios unavailable)")
+        return 0
+    except Exception as e:
+        o.bad(f"backend '{r.name}' failed listing clients: {type(e).__name__}: {e}")
+        return 1
     o.head("Per-client traffic (since each client associated)")
     o.info("Exit nodes push traffic out. Watching pulls it in.")
-    tg = r.clients()
     if not tg:
         o.info("no active wifi clients")
         return 0
-    names = {h["mac"]: h["name"] for h in r.hosts()}
+    try:
+        names = {h["mac"]: h["name"] for h in r.hosts()}
+        counters = r.counters(tg)
+    except Unsupported as e:
+        o.info(f"(no {e} from this backend)")
+        return 0
+    except Exception as e:
+        o.bad(f"backend '{r.name}' failed reading counters: {type(e).__name__}: {e}")
+        return 1
     rows = []
-    for mac, (down, up) in r.counters(tg).items():
+    for mac, (down, up) in counters.items():
         if mac == "WAN":
             continue
         rows.append((up / max(down, 1), mac, names.get(mac) or mac, down, up))
@@ -929,7 +1435,11 @@ def cmd_log(a, o: Out):
         r = connect_router(a, o)
         if not r:
             return 1
-        text = r.fetch_log()
+        try:
+            text = r.fetch_log()
+        except Unsupported as e:
+            o.bad(f"this backend has no {e}. Pass a saved log file instead.")
+            return 1
         if not text:
             o.bad("router returned no log")
             return 1
@@ -1029,8 +1539,12 @@ def cmd_monitor(a, o: Out):
     r = connect_router(a, o)
     if not r:
         return 1
-    tg = r.clients()
-    names = {h["mac"]: h["name"] for h in r.hosts()}
+    try:
+        tg = r.clients()
+        names = {h["mac"]: h["name"] for h in r.hosts()}
+    except Unsupported as e:
+        o.bad(f"this backend has no {e}, so live monitoring is unavailable")
+        return 1
     o.head(f"Monitoring {len(tg)} clients every {a.interval}s for {a.duration}s")
     o.info("One session only - these routers evict an older API session on new login.")
     totals = defaultdict(lambda: [0.0, 0.0])
@@ -1073,13 +1587,26 @@ def main(argv=None):
                     "for strangers. Scan only networks you own.")
     p.add_argument("--version", action="version", version=__version__)
     p.add_argument("--no-color", action="store_true")
+    p.add_argument("--list-backends", action="store_true",
+                   help="show router backends and whether each is hardware-verified")
+    if "--list-backends" in (argv if argv is not None else sys.argv[1:]):
+        print(f"{'backend':12} {'auth':6} status")
+        for n, c in sorted(ROUTERS.items()):
+            print(f"  {n:12} {'yes' if c.needs_auth else 'no ':6} "
+                  f"{'verified on hardware' if c.verified else 'from vendor docs, UNTESTED'}")
+        return 0
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def router_args(q):
-        q.add_argument("--router", default="192.168.1.1", help="router address")
-        q.add_argument("--type", default="sagemcom", choices=sorted(ROUTERS))
-        q.add_argument("--user", default="admin")
-        q.add_argument("--password", help="or set EXITCHECK_PASSWORD, or be prompted")
+        q.add_argument("--router", help="router address ($EXITCHECK_ROUTER, "
+                                        "default 192.168.1.1)")
+        q.add_argument("--type", choices=sorted(ROUTERS) + ["auto"],
+                       help="backend; default autodetect ($EXITCHECK_TYPE)")
+        q.add_argument("--user", help="$EXITCHECK_USER, else the backend default")
+        q.add_argument("--password", help="$EXITCHECK_PASSWORD, else prompted. "
+                                          "Prefer a .env file over the flag")
+        q.add_argument("--env-file", help="credentials file (default: ./.env "
+                                          "then ~/.exitcheck.env)")
         q.add_argument("--sha512", action="store_true",
                        help="router hashes with SHA-512 instead of MD5")
 
@@ -1123,6 +1650,7 @@ def main(argv=None):
 
     a = p.parse_args(argv)
     o = Out(color=not a.no_color)
+    load_env(getattr(a, "env_file", None))
     try:
         return a.fn(a, o)
     except KeyboardInterrupt:
