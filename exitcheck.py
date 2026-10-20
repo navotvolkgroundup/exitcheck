@@ -1528,6 +1528,15 @@ def cmd_tv(a, o: Out):
         o.info("upload ratios in `router`. The SDKs are usually opt-in behind an")
         o.info("in-app 'no ads if you share resources' dialog. If you do not use")
         o.info("these apps, removing them closes the question.")
+        o.info("")
+        o.info("Removal has to be done ON THE TV with the remote. Retail webOS")
+        o.info("exposes no app-management service over SSAP (every uninstall URI")
+        o.info("returns 404), and Tizen is the same, so no tool can do it for you:")
+        if kind == "lg":
+            o.info("  Home > highlight the app > press Up (or hold OK) > Remove")
+            o.info("  or: Home > LG Content Store > My Apps > Installed > Delete")
+        else:
+            o.info("  Home > Apps > Settings (gear) > highlight the app > Delete")
     else:
         o.ok("no app from a publisher on the known list")
         o.info("The list only covers publishers named in public research, so this")

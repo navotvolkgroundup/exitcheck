@@ -97,6 +97,11 @@ Massive, Honeygain/Oxylabs.
 First run shows a pairing prompt on the TV; accept it with the remote and the
 key is cached. Exit code `2` if anything is flagged.
 
+**Removing a flagged app has to be done on the TV itself.** Retail webOS
+exposes no app-management service over SSAP — every uninstall URI returns
+`404 no such service or method` — and Tizen is the same. No tool can do it
+remotely, so `tv` prints the on-screen steps instead of pretending otherwise.
+
 A flag identifies the **publisher**, not the build on your TV, and is not
 evidence the device is relaying — confirm that with `scan` and the upload
 ratios in `router`. Matching is on vendor and app ID only, never the title, so
